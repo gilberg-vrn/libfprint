@@ -64,12 +64,34 @@ typedef FpImage *(*GoodixTls5xxProcessFrameFn)(guint8 * pix);
 typedef GoodixTls5xxMcuConfig (*GoodixTls5xxGetMcuFn)(void);
 typedef void (*GoodixTls5xxResetStateFn)(FpDevice *);
 
+/// Decode a raw TLS image payload into a scan_width x scan_height pixel buffer.
+/// Optional: when NULL the default goodixtls5xx_decode_frame() is used.
+typedef void (*GoodixTls5xxDecodeFrameFn)(GoodixTls5xxPix * frame,
+                                          guint32           frame_size,
+                                          const guint8     *raw_frame);
+
+/// Build the final FpImage directly from the decoded raw frame and the
+/// calibration frame. Optional: when set it REPLACES the default
+/// subtract+squash+process_frame path (lets a driver do its own flat-field /
+/// enhancement). When NULL the default path is used.
+typedef FpImage *(*GoodixTls5xxProcessRawFn)(const GoodixTls5xxPix *raw,
+                                             const GoodixTls5xxPix *calibration,
+                                             guint width, guint height);
+
 struct _FpiDeviceGoodixTls5xxClass
 {
   FpiDeviceGoodixTlsClass    parent;
 
   GoodixTls5xxGetMcuFn       get_mcu_cfg; ///< provide the mcu config before fdt commands
+  /// Optional distinct config for the fdt-down (finger-down) command. Some
+  /// sensors need higher per-cell thresholds for fdt-down than for fdt-mode/up
+  /// so that the device only replies on actual contact (which makes the
+  /// fdt-down command block until a finger is present). When NULL, get_mcu_cfg
+  /// is used for fdt-down as well.
+  GoodixTls5xxGetMcuFn       get_mcu_cfg_fdt_down;
   GoodixTls5xxProcessFrameFn process_frame; ///< process a frame after it is decoded (e.g. crop it)
+  GoodixTls5xxDecodeFrameFn  decode_frame; ///< optional custom raw->pixel decode, may be NULL
+  GoodixTls5xxProcessRawFn   process_raw_frame; ///< optional: build FpImage from raw+calibration, may be NULL
   GoodixTls5xxResetStateFn   reset_state; ///< callback to reset the state, may be NULL
 
   guint16                    scan_width; ///< width of the raw scanner image

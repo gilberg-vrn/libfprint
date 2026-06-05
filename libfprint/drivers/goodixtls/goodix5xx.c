@@ -26,6 +26,7 @@
 #include "drivers/goodixtls/goodix5xx.h"
 #include "drivers_api.h"
 #include "goodix.h"
+#include <errno.h>
 #include <stdio.h>
 
 
@@ -60,12 +61,19 @@ enum SCAN_STAGES {
 
 
 static void
+send_switch_mode_cfg (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *, const guint8 *, guint16, GDestroyNotify, GoodixDefaultCallback, gpointer), GoodixTls5xxGetMcuFn cfg_fn)
+{
+  GoodixTls5xxMcuConfig cfg = cfg_fn ();
+
+  mode_switch (dev, cfg.data, cfg.data_len, cfg.free_fn, goodixtls5xx_check_none_cmd, ssm);
+}
+
+static void
 send_switch_mode (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *, const guint8 *, guint16, GDestroyNotify, GoodixDefaultCallback, gpointer))
 {
   FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
-  GoodixTls5xxMcuConfig cfg = cls->get_mcu_cfg ();
 
-  mode_switch (dev, cfg.data, cfg.data_len, cfg.free_fn, goodixtls5xx_check_none_cmd, ssm);
+  send_switch_mode_cfg (dev, ssm, mode_switch, cls->get_mcu_cfg);
 }
 static void on_calibrate_scan(FpDevice* dev, guint8* data, guint16 len, gpointer ssm, GError* err) {
   if (err) {
@@ -78,7 +86,10 @@ static void on_calibrate_scan(FpDevice* dev, guint8* data, guint16 len, gpointer
   if (!priv->calibration_img) {
     priv->calibration_img = calloc(cls->scan_height * cls->scan_width, sizeof(GoodixTls5xxPix));
   }
-  goodixtls5xx_decode_frame(priv->calibration_img, len, data);
+  if (cls->decode_frame)
+    cls->decode_frame(priv->calibration_img, len, data);
+  else
+    goodixtls5xx_decode_frame(priv->calibration_img, len, data);
 
   fpi_ssm_next_state(ssm);
 }
@@ -137,7 +148,9 @@ goodixtls5xx_check_firmware_version (FpDevice *dev, gchar *firmware,
   fp_dbg ("Device firmware: \"%s\"", firmware);
   FpiDeviceGoodixTls5xxClass * cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (FPI_DEVICE_GOODIXTLS5XX (dev));
 
-  if (strcmp (firmware, cls->firmware_version))
+  // Prefix match so a driver can accept a whole firmware family
+  // (e.g. GF_ST411SEC_APP_ covers both the 5110 and the 5f10/GF3206).
+  if (!g_str_has_prefix (firmware, cls->firmware_version))
     {
       g_set_error (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                    "Invalid device firmware: \"%s\"", firmware);
@@ -331,14 +344,30 @@ scan_on_read_img (FpDevice *dev, guint8 *data, guint16 len,
   FpiDeviceGoodixTls5xxPrivate* priv = fpi_device_goodixtls5xx_get_instance_private(self);
   FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
 
-  GoodixTls5xxPix * raw_frame = calloc (cls->scan_width * cls->scan_height, sizeof (GoodixTls5xxPix));
-  goodixtls5xx_decode_frame (raw_frame, len, data);
-  linear_subtract_inplace(raw_frame, priv->calibration_img, cls->scan_width * cls->scan_height);
-  guint8 * squashed = calloc (cls->scan_height * cls->scan_width, 1);
-  goodixtls5xx_squash_frame_linear (raw_frame, squashed, cls->scan_height * cls->scan_width);
-  free (raw_frame);
-  FpImage * img = cls->process_frame (squashed);
-  free(squashed);
+  const guint frame_px = cls->scan_width * cls->scan_height;
+  GoodixTls5xxPix * raw_frame = calloc (frame_px, sizeof (GoodixTls5xxPix));
+  if (cls->decode_frame)
+    cls->decode_frame (raw_frame, len, data);
+  else
+    goodixtls5xx_decode_frame (raw_frame, len, data);
+
+  FpImage * img;
+  if (cls->process_raw_frame)
+    {
+      // Driver-specific flat-field / enhancement straight from raw+calibration.
+      img = cls->process_raw_frame (raw_frame, priv->calibration_img,
+                                    cls->scan_width, cls->scan_height);
+      free (raw_frame);
+    }
+  else
+    {
+      linear_subtract_inplace(raw_frame, priv->calibration_img, cls->scan_width * cls->scan_height);
+      guint8 * squashed = calloc (cls->scan_height * cls->scan_width, 1);
+      goodixtls5xx_squash_frame_linear (raw_frame, squashed, cls->scan_height * cls->scan_width);
+      free (raw_frame);
+      img = cls->process_frame (squashed);
+      free(squashed);
+    }
 
   fpi_image_device_image_captured (img_dev, img);
 
@@ -383,7 +412,15 @@ scan_run_state (FpiSsm * ssm, FpDevice * dev)
       do_calibration(dev, ssm);
       break;
     case SCAN_STAGE_SWITCH_TO_FDT_DOWN:
-      send_switch_mode (dev, ssm, goodix_send_mcu_switch_to_fdt_down );
+      {
+        FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
+        /* fdt-down replies (and so this command completes) only when a finger
+         * is on the sensor, which requires the proper fdt-down thresholds.
+         * Drivers needing distinct thresholds provide get_mcu_cfg_fdt_down. */
+        send_switch_mode_cfg (dev, ssm, goodix_send_mcu_switch_to_fdt_down,
+                              cls->get_mcu_cfg_fdt_down ? cls->get_mcu_cfg_fdt_down
+                                                        : cls->get_mcu_cfg);
+      }
       break;
 
     case SCAN_STAGE_GET_IMG:
