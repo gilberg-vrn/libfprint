@@ -74,6 +74,13 @@ enum activate_states {
   ACTIVATE_CHECK_PSK,
   ACTIVATE_RESET,
   ACTIVATE_SET_MCU_IDLE,
+  /* The Windows driver issues a second reset right before the config upload
+   * (RESET, read_otp, RESET, upload_config). Mirroring that double reset is
+   * what reliably clears an MCU left mid-FDT by a previously crashed TLS
+   * session (e.g. an interrupted login-screen verify): a single reset/rebind
+   * does not revive such a hung MCU, but the vendor's reset-before-upload
+   * does. Harmless on a clean (warm) activation. */
+  ACTIVATE_RESET2,
   ACTIVATE_UPLOAD_MCU_CONFIG,
   ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY,
   ACTIVATE_NUM_STATES,
@@ -129,6 +136,10 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
                                            ssm);
       break;
 
+    case ACTIVATE_RESET2:
+      goodix_send_reset (dev, TRUE, 20, goodixtls5xx_check_reset, ssm);
+      break;
+
     case ACTIVATE_UPLOAD_MCU_CONFIG:
       goodix_send_upload_config_mcu (dev, goodix_5f10_config,
                                      sizeof (goodix_5f10_config), NULL,
@@ -167,6 +178,23 @@ static const guint8 fdt_switch_state_mode[] = {
   0x80, 0x8f, 0x80, 0x94, 0x80, 0x8b, 0x80, 0x8a, 0x80, 0x83,
 };
 
+// Same thresholds as above but with the leading fdt-mode selector byte (0x0d)
+// that the firmware expects. goodix_send_mcu_switch_to_fdt_mode() sends its
+// payload verbatim (it does not prepend a selector, unlike fdt-down/fdt-up
+// which get 0x0c/0x0e), so without this byte the fdt-mode command goes out
+// malformed as "01 80a0 ..." instead of "0d 01 80a0 ...". A warm MCU tolerates
+// the malformed command, but a cold-booted one mis-arms its finger-detect
+// engine and emits a spurious fdt reply, which desyncs the protocol read loop
+// for the rest of that activation (every subsequent frame is garbage -> no
+// match) until a full re-activation. Sending the proper selector fixes the
+// cold-boot first-activation. (The Windows driver uses 0x09 here; this sensor
+// family's Linux framing uses the 0x0c/0x0d/0x0e selector set, matching the
+// 0x0c already prepended for fdt-down.)
+static const guint8 fdt_switch_state_mode_primed[] = {
+  0x0d, 0x01, 0x80, 0xa0, 0x80, 0x93, 0x80, 0x9b, 0x80, 0x94, 0x80, 0x90,
+  0x80, 0x8f, 0x80, 0x94, 0x80, 0x8b, 0x80, 0x8a, 0x80, 0x83,
+};
+
 // Higher per-cell thresholds for fdt-down: the device only sends the fdt-down
 // reply once capacitance exceeds these (i.e. a finger is on the sensor), so the
 // fdt-down command blocks until contact. Using the (lower) fdt-mode thresholds
@@ -195,6 +223,17 @@ get_mcu_config_fdt_down (void)
   cfg.free_fn = NULL;
   cfg.data = fdt_switch_state_down;
   cfg.data_len = sizeof (fdt_switch_state_down);
+  return cfg;
+}
+
+static GoodixTls5xxMcuConfig
+get_mcu_config_fdt_mode (void)
+{
+  GoodixTls5xxMcuConfig cfg;
+
+  cfg.free_fn = NULL;
+  cfg.data = fdt_switch_state_mode_primed;
+  cfg.data_len = sizeof (fdt_switch_state_mode_primed);
   return cfg;
 }
 
@@ -369,6 +408,7 @@ fpi_device_goodixtls5f10_class_init (FpiDeviceGoodixTls5f10Class *class)
 
   xx_cls->get_mcu_cfg = get_mcu_config;
   xx_cls->get_mcu_cfg_fdt_down = get_mcu_config_fdt_down;
+  xx_cls->get_mcu_cfg_fdt_mode = get_mcu_config_fdt_mode;
   xx_cls->process_frame = process_frame;
   xx_cls->decode_frame = decode_frame_5f10;
   xx_cls->process_raw_frame = process_raw_5f10;

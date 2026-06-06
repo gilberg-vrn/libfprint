@@ -405,7 +405,16 @@ scan_run_state (FpiSsm * ssm, FpDevice * dev)
       goodix_send_query_mcu_state (dev, query_mcu_state_cb, ssm);
       break;
     case SCAN_STAGE_SWITCH_TO_FDT_MODE:
-      send_switch_mode (dev, ssm, goodix_send_mcu_switch_to_fdt_mode);
+      {
+        FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
+        /* goodix_send_mcu_switch_to_fdt_mode sends its payload verbatim (no
+         * selector byte is prepended, unlike fdt-down/fdt-up). Sensors whose
+         * firmware requires the leading fdt-mode selector provide it via
+         * get_mcu_cfg_fdt_mode; others fall back to get_mcu_cfg unchanged. */
+        send_switch_mode_cfg (dev, ssm, goodix_send_mcu_switch_to_fdt_mode,
+                              cls->get_mcu_cfg_fdt_mode ? cls->get_mcu_cfg_fdt_mode
+                                                        : cls->get_mcu_cfg);
+      }
       break;
 
     case SCAN_STAGE_CALIBRATE:
