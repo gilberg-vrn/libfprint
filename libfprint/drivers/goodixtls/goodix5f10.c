@@ -86,15 +86,20 @@ enum activate_states {
   ACTIVATE_NUM_STATES,
 };
 
-// The GF3206 replies 0x00 to the MCU config upload even on success (the 5110
-// replies non-zero), so the generic success check would wrongly fail here.
-// Only a transport-level error is fatal.
+// The MCU accepts the config (status 0x01) only when the bytes are correct;
+// a wrong/corrupt config is rejected with 0x00. Treat rejection as fatal so a
+// bad config surfaces immediately instead of silently leaving the FDT engine
+// unconfigured (which manifests later as "MCU has no config" / FDT timeouts).
 static void
 check_config_upload_5f10 (FpDevice *dev, gboolean success, gpointer ssm,
                           GError *error)
 {
   if (error)
     fpi_ssm_mark_failed (ssm, error);
+  else if (!success)
+    fpi_ssm_mark_failed (ssm,
+                         g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                      "MCU config upload rejected by sensor"));
   else
     fpi_ssm_next_state (ssm);
 }
