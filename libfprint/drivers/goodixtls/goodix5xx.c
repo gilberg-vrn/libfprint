@@ -30,10 +30,15 @@
 #include <stdio.h>
 
 
+#define GOODIX5XX_MAX_FDT_CELLS 32
+
 typedef struct
 {
   guint8 * otp; // TODO: Remove
   GoodixTls5xxPix* calibration_img;
+  guint8   fdt_cells[GOODIX5XX_MAX_FDT_CELLS];
+  guint    n_fdt_cells;
+  gboolean fdt_have;
 } FpiDeviceGoodixTls5xxPrivate;
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpiDeviceGoodixTls5xx, fpi_device_goodixtls5xx, FPI_TYPE_DEVICE_GOODIXTLS)
@@ -60,12 +65,91 @@ enum SCAN_STAGES {
 };
 
 
-static void
-send_switch_mode_cfg (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *, const guint8 *, guint16, GDestroyNotify, GoodixDefaultCallback, gpointer), GoodixTls5xxGetMcuFn cfg_fn)
+// Copy an fdt template, replacing the value byte after each 0x80 flag with the
+// next derived cell. The template is [selector...][0x80 v][0x80 v]...; the scan
+// skips the selector header (bytes before the first 0x80) then steps in pairs,
+// stopping if the [0x80, value] pattern breaks. Returns NULL on allocation
+// failure; the caller falls back to the unmodified template.
+static guint8 *
+apply_adaptive_fdt (const guint8 *tmpl, guint16 len,
+                    const guint8 *cells, guint n_cells)
 {
+  guint8 *out = malloc (len);
+  guint start = 0, k = 0;
+
+  if (!out)
+    return NULL;
+  memcpy (out, tmpl, len);
+  while (start < len && tmpl[start] != 0x80)
+    start++;
+  for (guint i = start; i + 1 < len && k < n_cells; i += 2)
+    {
+      if (tmpl[i] != 0x80)
+        break;
+      out[i + 1] = cells[k++];
+    }
+  return out;
+}
+
+// fdt-mode reply body: 00 00 01 00 <Nx LE uint16 baseline>. Each fdt threshold
+// cell is derived as baseline >> 1 (the 0x80 flag is supplied by the template).
+static void
+on_fdt_mode_baseline (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm,
+                      GError *err)
+{
+  if (err)
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+
+  FpiDeviceGoodixTls5xxPrivate *priv = fpi_device_goodixtls5xx_get_instance_private (
+    FPI_DEVICE_GOODIXTLS5XX (dev));
+
+  if (data && len >= 6)
+    {
+      guint n = 0;
+      for (guint i = 4; i + 1 < len && n < GOODIX5XX_MAX_FDT_CELLS; i += 2)
+        {
+          guint16 b = data[i] | (data[i + 1] << 8);
+          priv->fdt_cells[n++] = (b >> 1) & 0xff;
+        }
+      priv->n_fdt_cells = n;
+      priv->fdt_have = n > 0;
+    }
+  else
+    {
+      fp_dbg ("short fdt-mode reply (%u bytes), keeping previous thresholds", len);
+    }
+
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+send_switch_mode_cfg (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *, const guint8 *, guint16, GDestroyNotify, GoodixDefaultCallback, gpointer), GoodixTls5xxGetMcuFn cfg_fn, GoodixDefaultCallback cb)
+{
+  FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
   GoodixTls5xxMcuConfig cfg = cfg_fn ();
 
-  mode_switch (dev, cfg.data, cfg.data_len, cfg.free_fn, goodixtls5xx_check_none_cmd, ssm);
+  if (cls->fdt_adaptive)
+    {
+      FpiDeviceGoodixTls5xxPrivate *priv = fpi_device_goodixtls5xx_get_instance_private (
+        FPI_DEVICE_GOODIXTLS5XX (dev));
+      guint8 *adapt = priv->fdt_have
+                      ? apply_adaptive_fdt (cfg.data, cfg.data_len,
+                                            priv->fdt_cells, priv->n_fdt_cells)
+                      : NULL;
+
+      if (adapt)
+        {
+          if (cfg.free_fn)
+            cfg.free_fn ((void *) cfg.data);
+          mode_switch (dev, adapt, cfg.data_len, free, cb, ssm);
+          return;
+        }
+    }
+
+  mode_switch (dev, cfg.data, cfg.data_len, cfg.free_fn, cb, ssm);
 }
 
 static void
@@ -73,7 +157,8 @@ send_switch_mode (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *, 
 {
   FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
 
-  send_switch_mode_cfg (dev, ssm, mode_switch, cls->get_mcu_cfg);
+  send_switch_mode_cfg (dev, ssm, mode_switch, cls->get_mcu_cfg,
+                        goodixtls5xx_check_none_cmd);
 }
 static void on_calibrate_scan(FpDevice* dev, guint8* data, guint16 len, gpointer ssm, GError* err) {
   if (err) {
@@ -402,18 +487,31 @@ scan_run_state (FpiSsm * ssm, FpDevice * dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case SCAN_STAGE_QUERY_MCU:
-      goodix_send_query_mcu_state (dev, query_mcu_state_cb, ssm);
+      {
+        // Re-prime the baseline each scan: clear it so the fdt-mode prime sends
+        // the raw template and its reply repopulates the thresholds for this
+        // scan's fdt-down/up.
+        FpiDeviceGoodixTls5xxPrivate *priv = fpi_device_goodixtls5xx_get_instance_private (
+          FPI_DEVICE_GOODIXTLS5XX (dev));
+        priv->fdt_have = FALSE;
+        goodix_send_query_mcu_state (dev, query_mcu_state_cb, ssm);
+      }
       break;
     case SCAN_STAGE_SWITCH_TO_FDT_MODE:
       {
         FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
+        GoodixTls5xxGetMcuFn cfg_fn = cls->get_mcu_cfg_fdt_mode
+                                      ? cls->get_mcu_cfg_fdt_mode
+                                      : cls->get_mcu_cfg;
         /* goodix_send_mcu_switch_to_fdt_mode sends its payload verbatim (no
          * selector byte is prepended, unlike fdt-down/fdt-up). Sensors whose
          * firmware requires the leading fdt-mode selector provide it via
-         * get_mcu_cfg_fdt_mode; others fall back to get_mcu_cfg unchanged. */
-        send_switch_mode_cfg (dev, ssm, goodix_send_mcu_switch_to_fdt_mode,
-                              cls->get_mcu_cfg_fdt_mode ? cls->get_mcu_cfg_fdt_mode
-                                                        : cls->get_mcu_cfg);
+         * get_mcu_cfg_fdt_mode; others fall back to get_mcu_cfg unchanged.
+         * In adaptive mode the reply carries the live baseline, so the callback
+         * captures it (on_fdt_mode_baseline) to derive the fdt-down/up thresholds. */
+        send_switch_mode_cfg (dev, ssm, goodix_send_mcu_switch_to_fdt_mode, cfg_fn,
+                              cls->fdt_adaptive ? on_fdt_mode_baseline
+                                                : goodixtls5xx_check_none_cmd);
       }
       break;
 
@@ -428,7 +526,8 @@ scan_run_state (FpiSsm * ssm, FpDevice * dev)
          * Drivers needing distinct thresholds provide get_mcu_cfg_fdt_down. */
         send_switch_mode_cfg (dev, ssm, goodix_send_mcu_switch_to_fdt_down,
                               cls->get_mcu_cfg_fdt_down ? cls->get_mcu_cfg_fdt_down
-                                                        : cls->get_mcu_cfg);
+                                                        : cls->get_mcu_cfg,
+                              goodixtls5xx_check_none_cmd);
       }
       break;
 

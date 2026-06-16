@@ -95,6 +95,8 @@ struct _FpiDeviceGoodixTls5xxClass
   /// sensor whose firmware requires the leading fdt-mode selector byte must
   /// include it here. When NULL, get_mcu_cfg is used for fdt-mode as well.
   GoodixTls5xxGetMcuFn       get_mcu_cfg_fdt_mode;
+  /// derive fdt thresholds live from the fdt-mode baseline reply instead of the fixed get_mcu_cfg_fdt_* templates
+  gboolean                   fdt_adaptive;
   GoodixTls5xxProcessFrameFn process_frame; ///< process a frame after it is decoded (e.g. crop it)
   GoodixTls5xxDecodeFrameFn  decode_frame; ///< optional custom raw->pixel decode, may be NULL
   GoodixTls5xxProcessRawFn   process_raw_frame; ///< optional: build FpImage from raw+calibration, may be NULL

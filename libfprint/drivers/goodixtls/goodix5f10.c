@@ -66,6 +66,9 @@ G_DEFINE_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10,
 
 // ---- ACTIVE SECTION START ----
 
+static GoodixTls5xxMcuConfig get_mcu_config (void);
+static GoodixTls5xxMcuConfig get_mcu_config_fdt_mode (void);
+
 enum activate_states {
   ACTIVATE_READ_AND_NOP,
   ACTIVATE_ENABLE_CHIP,
@@ -83,6 +86,16 @@ enum activate_states {
   ACTIVATE_RESET2,
   ACTIVATE_UPLOAD_MCU_CONFIG,
   ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY,
+  /* Warm up the finger-detect engine with a couple of throwaway fdt-mode/fdt-up
+   * rounds (no finger needed; they return immediately). The very first fdt-down
+   * after a cold activation is otherwise sluggish (~1.5s to register a press),
+   * which makes the first touch of a session feel like it triggers on release.
+   * Windows keeps the engine warm via the always-on power-button scan; we don't,
+   * so we converge the per-cell baseline tracker here before the first capture. */
+  ACTIVATE_FDT_WARM_MODE_1,
+  ACTIVATE_FDT_WARM_UP_1,
+  ACTIVATE_FDT_WARM_MODE_2,
+  ACTIVATE_FDT_WARM_UP_2,
   ACTIVATE_NUM_STATES,
 };
 
@@ -155,6 +168,26 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_set_powerdown_scan_frequency (
         dev, 100, goodixtls5xx_check_powerdown_scan_freq, ssm);
       break;
+
+    case ACTIVATE_FDT_WARM_MODE_1:
+    case ACTIVATE_FDT_WARM_MODE_2:
+      {
+        GoodixTls5xxMcuConfig cfg = get_mcu_config_fdt_mode ();
+        goodix_send_mcu_switch_to_fdt_mode (dev, cfg.data, cfg.data_len,
+                                            cfg.free_fn,
+                                            goodixtls5xx_check_none_cmd, ssm);
+      }
+      break;
+
+    case ACTIVATE_FDT_WARM_UP_1:
+    case ACTIVATE_FDT_WARM_UP_2:
+      {
+        GoodixTls5xxMcuConfig cfg = get_mcu_config ();
+        goodix_send_mcu_switch_to_fdt_up (dev, cfg.data, cfg.data_len,
+                                          cfg.free_fn,
+                                          goodixtls5xx_check_none_cmd, ssm);
+      }
+      break;
     }
 }
 
@@ -176,34 +209,22 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
 // ---- SCAN SECTION START ----
 
-// FDT threshold block (payload after the mode opcode byte) for the
-// fdt-mode / fdt-up switch commands.
+// FDT threshold templates: [selector] followed by [0x80, value] cells. With
+// fdt_adaptive (see class_init) the value bytes are recomputed each scan from
+// the live baseline; only the selector framing and cell count are used here.
+// fdt-mode carries the 0x0d selector inline (the transport prepends 0x0c/0x0e
+// for fdt-down/fdt-up but nothing for fdt-mode); the seed values are a cold-start
+// baseline>>1 estimate, used only until the first reply lands.
 static const guint8 fdt_switch_state_mode[] = {
   0x01, 0x80, 0xa0, 0x80, 0x93, 0x80, 0x9b, 0x80, 0x94, 0x80, 0x90,
   0x80, 0x8f, 0x80, 0x94, 0x80, 0x8b, 0x80, 0x8a, 0x80, 0x83,
 };
 
-// Same thresholds as above but with the leading fdt-mode selector byte (0x0d)
-// that the firmware expects. goodix_send_mcu_switch_to_fdt_mode() sends its
-// payload verbatim (it does not prepend a selector, unlike fdt-down/fdt-up
-// which get 0x0c/0x0e), so without this byte the fdt-mode command goes out
-// malformed as "01 80a0 ..." instead of "0d 01 80a0 ...". A warm MCU tolerates
-// the malformed command, but a cold-booted one mis-arms its finger-detect
-// engine and emits a spurious fdt reply, which desyncs the protocol read loop
-// for the rest of that activation (every subsequent frame is garbage -> no
-// match) until a full re-activation. Sending the proper selector fixes the
-// cold-boot first-activation. (The Windows driver uses 0x09 here; this sensor
-// family's Linux framing uses the 0x0c/0x0d/0x0e selector set, matching the
-// 0x0c already prepended for fdt-down.)
 static const guint8 fdt_switch_state_mode_primed[] = {
   0x0d, 0x01, 0x80, 0xa0, 0x80, 0x93, 0x80, 0x9b, 0x80, 0x94, 0x80, 0x90,
   0x80, 0x8f, 0x80, 0x94, 0x80, 0x8b, 0x80, 0x8a, 0x80, 0x83,
 };
 
-// Higher per-cell thresholds for fdt-down: the device only sends the fdt-down
-// reply once capacitance exceeds these (i.e. a finger is on the sensor), so the
-// fdt-down command blocks until contact. Using the (lower) fdt-mode thresholds
-// here would make it fire immediately on the bare baseline.
 static const guint8 fdt_switch_state_down[] = {
   0x01, 0x80, 0xb9, 0x80, 0xb4, 0x80, 0xb5, 0x80, 0xaf, 0x80, 0xb4,
   0x80, 0xac, 0x80, 0xb2, 0x80, 0xa7, 0x80, 0xab, 0x80, 0xa5,
@@ -312,11 +333,6 @@ process_frame (guint8 *squashed)
   return img;
 }
 
-// Build the image straight from raw + calibration. The bare sensor has a strong
-// per-pixel multiplicative fixed pattern (vertical stripes); a plain subtraction
-// leaves beaded, broken ridges that defeat minutiae extraction. Dividing by the
-// calibration frame cancels that pattern, then a contrast stretch and a small
-// Gaussian merge the beads into continuous ridges that MINDTCT can work with.
 // Box blur with radius r (edge-clamped), separable. Approximates a Gaussian.
 static void
 box_blur (const gfloat *src, gfloat *dst, guint w, guint h, int r)
@@ -350,6 +366,8 @@ box_blur (const gfloat *src, gfloat *dst, guint w, guint h, int r)
   g_free (tmp);
 }
 
+// Turn the raw frame and the no-finger calibration frame into an 8-bit image
+// for SIGFM (SIFT) matching.
 static FpImage *
 process_raw_5f10 (const GoodixTls5xxPix *raw, const GoodixTls5xxPix *calib,
                   guint w, guint h)
@@ -359,14 +377,13 @@ process_raw_5f10 (const GoodixTls5xxPix *raw, const GoodixTls5xxPix *calib,
   gfloat *lp = g_malloc (n * sizeof (gfloat));
 
   // 1) Flat-field by division: cancels the per-pixel multiplicative fixed
-  //    pattern (vertical stripes) of the bare sensor.
+  //    pattern (vertical stripes) of the bare sensor, which would otherwise
+  //    produce repeatable SIFT keypoints unrelated to the finger.
   for (guint i = 0; i < n; ++i)
     flat[i] = (gfloat) raw[i] / MAX (calib[i], 1);
 
   // 2) High-pass: subtract a low-pass (local background) to remove the slow
-  //    pressure/vignette gradient and isolate the ridge-scale signal. This
-  //    keeps ridges continuous and high-contrast (vs. the beaded result of a
-  //    plain subtraction) without over-smoothing away minutiae.
+  //    pressure/vignette gradient and isolate the ridge-scale signal.
   box_blur (flat, lp, w, h, 3);
 
   gdouble sum = 0, sum2 = 0;
@@ -414,6 +431,9 @@ fpi_device_goodixtls5f10_class_init (FpiDeviceGoodixTls5f10Class *class)
   xx_cls->get_mcu_cfg = get_mcu_config;
   xx_cls->get_mcu_cfg_fdt_down = get_mcu_config_fdt_down;
   xx_cls->get_mcu_cfg_fdt_mode = get_mcu_config_fdt_mode;
+  // The GF3206 baseline drifts, so fixed thresholds mis-arm finger detection;
+  // derive them live from the fdt-mode reply instead.
+  xx_cls->fdt_adaptive = TRUE;
   xx_cls->process_frame = process_frame;
   xx_cls->decode_frame = decode_frame_5f10;
   xx_cls->process_raw_frame = process_raw_5f10;
